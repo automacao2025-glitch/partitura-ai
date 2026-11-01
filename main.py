@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 from basic_pitch.inference import predict
 from basic_pitch import ICASSP_2022_MODEL_PATH
 
-app = FastAPI(title="Partitura.ai - Universal Engine")
+app = FastAPI(title="Partitura.ai - Full Engine")
 
 UPLOAD_DIR = Path("temp_uploads")
 OUTPUT_DIR = Path("temp_outputs")
@@ -71,12 +71,12 @@ HTML_TEMPLATE = """
 <body>
     <div class="container">
         <h1>🎵 Partitura.ai</h1>
-        <p class="subtitle">Transcrição Musical Inteligente, Rápida e Autónoma</p>
+        <p class="subtitle">Transcrição Musical Inteligente (Música Inteira)</p>
         
         <form id="uploadForm">
             <div class="upload-box" onclick="document.getElementById('audioFile').click()">
                 <strong style="font-size: 17px; color: #1e293b;">Clique aqui ou arraste o seu ficheiro de áudio</strong><br>
-                <span style="font-size: 13px; color: #64748b; display: inline-block; margin-top: 6px;">Formatos suportados: MP3, WAV, M4A, FLAC, OGG</span>
+                <span style="font-size: 13px; color: #64748b; display: inline-block; margin-top: 6px;">Formatos suportados: MP3, WAV, M4A, FLAC, OGG (Música completa)</span>
                 <input type="file" id="audioFile" name="file" accept=".mp3,.m4a,.wav,.flac,.ogg" style="display: none;" required>
             </div>
             
@@ -90,7 +90,7 @@ HTML_TEMPLATE = """
         <div id="loadingSection">
             <div class="spinner"></div>
             <h3 style="margin: 0 0 6px 0;">⚡ A processar a IA...</h3>
-            <p id="stepText" style="margin: 0; font-size: 14px;">A analisar áudio e a compor pauta musical em Clave de Sol...</p>
+            <p id="stepText" style="margin: 0; font-size: 14px;">A analisar áudio completo e a compor pauta musical...</p>
         </div>
 
         <div id="resultSection">
@@ -185,16 +185,14 @@ HTML_TEMPLATE = """
 </html>
 """
 
-def fast_audio_processing(safe_input_path: Path, clean_target: Path):
+def full_audio_processing(safe_input_path: Path, clean_target: Path):
     try:
-        # Carrega até 90s em 22050Hz Mono (suporta MP3, M4A, WAV e protege os 512MB de RAM do Render)
-        y, sr = librosa.load(str(safe_input_path), sr=22050, mono=True, duration=90.0)
+        # Carrega a música inteira sem corte de duração
+        y, sr = librosa.load(str(safe_input_path), sr=22050, mono=True)
         
-        # Separação rápida de harmonia (remove batidas secas de percussão)
         y_harmonic, _ = librosa.effects.hpss(y)
         sf.write(str(clean_target), y_harmonic, sr, subtype='PCM_16')
 
-        # Deteção real de BPM e Compasso
         onset_env = librosa.onset.onset_strength(y=y_harmonic, sr=sr)
         tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
         bpm = float(np.ndim(tempo) and tempo[0] or tempo)
@@ -207,11 +205,9 @@ def fast_audio_processing(safe_input_path: Path, clean_target: Path):
 
         time_sig = "2/4" if bpm >= 128 else "4/4"
 
-        # Liberta memória antes de chamar a IA
         del y, y_harmonic, onset_env
         gc.collect()
 
-        # Passa explicitamente o ICASSP_2022_MODEL_PATH para nunca dar erro de argumento
         _, midi_data, _ = predict(str(clean_target.resolve()), ICASSP_2022_MODEL_PATH)
         return midi_data, round(bpm, 1), time_sig
     except Exception as e:
@@ -233,7 +229,7 @@ async def convert_audio_ai(file: UploadFile = File(...)):
             f.write(await file.read())
 
         midi_data, detected_bpm, detected_ts = await asyncio.to_thread(
-            fast_audio_processing, safe_input_path, clean_target
+            full_audio_processing, safe_input_path, clean_target
         )
 
         sec_per_quarter = 60.0 / detected_bpm
