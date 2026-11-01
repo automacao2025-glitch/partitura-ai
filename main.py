@@ -14,7 +14,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 from basic_pitch.inference import predict
 from basic_pitch import ICASSP_2022_MODEL_PATH
 
-app = FastAPI(title="Partitura.ai - Full Engine")
+app = FastAPI(title="Partitura.ai - Chunked Engine")
 
 UPLOAD_DIR = Path("temp_uploads")
 OUTPUT_DIR = Path("temp_outputs")
@@ -71,12 +71,12 @@ HTML_TEMPLATE = """
 <body>
     <div class="container">
         <h1>🎵 Partitura.ai</h1>
-        <p class="subtitle">Transcrição Musical Inteligente (Música Inteira)</p>
+        <p class="subtitle">Transcrição Musical Inteligente (Música Inteira Otimizada)</p>
         
         <form id="uploadForm">
             <div class="upload-box" onclick="document.getElementById('audioFile').click()">
                 <strong style="font-size: 17px; color: #1e293b;">Clique aqui ou arraste o seu ficheiro de áudio</strong><br>
-                <span style="font-size: 13px; color: #64748b; display: inline-block; margin-top: 6px;">Formatos suportados: MP3, WAV, M4A, FLAC, OGG (Música completa)</span>
+                <span style="font-size: 13px; color: #64748b; display: inline-block; margin-top: 6px;">Formatos suportados: MP3, WAV, M4A, FLAC, OGG</span>
                 <input type="file" id="audioFile" name="file" accept=".mp3,.m4a,.wav,.flac,.ogg" style="display: none;" required>
             </div>
             
@@ -89,8 +89,8 @@ HTML_TEMPLATE = """
 
         <div id="loadingSection">
             <div class="spinner"></div>
-            <h3 style="margin: 0 0 6px 0;">⚡ A processar a IA...</h3>
-            <p id="stepText" style="margin: 0; font-size: 14px;">A analisar áudio completo e a compor pauta musical...</p>
+            <h3 style="margin: 0 0 6px 0;">⚡ A processar a IA em blocos...</h3>
+            <p id="stepText" style="margin: 0; font-size: 14px;">A analisar música completa e a compor pauta musical...</p>
         </div>
 
         <div id="resultSection">
@@ -165,7 +165,7 @@ HTML_TEMPLATE = """
                     await osmd.load(data.xml_content);
                     osmd.render();
                 } else {
-                    alert("Aviso: " + (data.detail || "Falha no processamento."));
+                    alert("Aviso do Servidor: " + (data.detail || "Falha no processamento."));
                     loadingSection.style.display = 'none';
                 }
             } catch (err) {
@@ -185,15 +185,15 @@ HTML_TEMPLATE = """
 </html>
 """
 
-def full_audio_processing(safe_input_path: Path, clean_target: Path):
+def chunked_audio_processing(safe_input_path: Path, session_dir: Path):
     try:
-        # Carrega a música inteira sem corte de duração
-        y, sr = librosa.load(str(safe_input_path), sr=22050, mono=True)
-        
-        y_harmonic, _ = librosa.effects.hpss(y)
-        sf.write(str(clean_target), y_harmonic, sr, subtype='PCM_16')
+        # Carrega a duração total do áudio
+        y_full, sr = librosa.load(str(safe_input_path), sr=22050, mono=True)
+        total_duration = len(y_full) / sr
 
-        onset_env = librosa.onset.onset_strength(y=y_harmonic, sr=sr)
+        # Deteção geral de BPM
+        y_harmonic_full, _ = librosa.effects.hpss(y_full)
+        onset_env = librosa.onset.onset_strength(y=y_harmonic_full, sr=sr)
         tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
         bpm = float(np.ndim(tempo) and tempo[0] or tempo)
         if bpm <= 0:
@@ -202,16 +202,86 @@ def full_audio_processing(safe_input_path: Path, clean_target: Path):
             bpm /= 2.0
         elif bpm < 58:
             bpm *= 2.0
-
         time_sig = "2/4" if bpm >= 128 else "4/4"
 
-        del y, y_harmonic, onset_env
+        del y_harmonic_full, onset_env
         gc.collect()
 
-        _, midi_data, _ = predict(str(clean_target.resolve()), ICASSP_2022_MODEL_PATH)
-        return midi_data, round(bpm, 1), time_sig
+        # Processamento em Chunks de 30 segundos para poupar RAM
+        chunk_duration = 30.0
+        all_notes = []
+        
+        class MockNote:
+            def __init__(self, start, end, pitch, velocity):
+                self.start = start
+                self.end = end
+                self.pitch = pitch
+                self.velocity = velocity
+
+        class MockInstrument:
+            def __init__(self, notes):
+                self.notes = notes
+
+        class MockMidiData:
+            def __init__(self, instruments):
+                self.instruments = instruments
+                
+            def write(self, path):
+                import pretty_midi
+                pm = pretty_midi.PrettyMIDI(initial_tempo=bpm)
+                inst = pretty_midi.Instrument(program=0)
+                for n in self.notes:
+                    inst.notes.append(pretty_midi.Note(velocity=int(n.velocity), pitch=int(n.pitch), start=float(n.start), end=float(n.end)))
+                pm.instruments.append(inst)
+                pm.write(path)
+
+        start_time = 0.0
+        chunk_idx = 0
+        while start_time < total_duration:
+            end_time = min(start_time + chunk_duration, total_duration)
+            start_sample = int(start_time * sr)
+            end_sample = int(end_time * sr)
+            
+            y_chunk = y_full[start_sample:end_sample]
+            if len(y_chunk) < sr * 2: # Ignora pedaços finais muito curtos (< 2s)
+                break
+
+            y_harm_chunk, _ = librosa.effects.hpss(y_chunk)
+            chunk_file = session_dir / f"chunk_{chunk_idx}.wav"
+            sf.write(str(chunk_file), y_harm_chunk, sr, subtype='PCM_16')
+
+            # Predição do Basic Pitch para este bloco
+            _, midi_data_chunk, _ = predict(str(chunk_file.resolve()), ICASSP_2022_MODEL_PATH)
+            
+            for inst in midi_data_chunk.instruments:
+                for n in inst.notes:
+                    # Desloca o tempo absoluto somando o início do chunk
+                    real_start = n.start + start_time
+                    real_end = n.end + start_time
+                    all_notes.append(MockNote(real_start, real_end, n.pitch, n.velocity))
+
+            # Limpa ficheiro e memória do chunk atual
+            try:
+                chunk_file.unlink()
+            except Exception:
+                pass
+            del y_chunk, y_harm_chunk, midi_data_chunk
+            gc.collect()
+
+            start_time += chunk_duration
+            chunk_idx += 1
+
+        del y_full
+        gc.collect()
+
+        # Cria um objeto unificado com todas as notas da música inteira
+        final_midi = MockMidiData([MockInstrument(all_notes)])
+        final_midi.notes = all_notes
+        
+        return final_midi, round(bpm, 1), time_sig
+
     except Exception as e:
-        raise RuntimeError(f"Erro no processamento de áudio: {type(e).__name__} - {str(e)}")
+        raise RuntimeError(f"Falha no processamento em blocos: {str(e)}")
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -222,14 +292,19 @@ async def convert_audio_ai(file: UploadFile = File(...)):
     session_id = uuid.uuid4().hex[:8]
     ext = os.path.splitext(file.filename)[1].lower() or ".wav"
     safe_input_path = UPLOAD_DIR / f"raw_{session_id}{ext}"
-    clean_target = UPLOAD_DIR / f"norm_{session_id}.wav"
+    session_dir = UPLOAD_DIR / f"session_{session_id}"
+    session_dir.mkdir(exist_ok=True)
     
     try:
+        content = await file.read()
+        if not content:
+            raise HTTPException(status_code=400, detail="O ficheiro de áudio enviado está vazio.")
+            
         with open(safe_input_path, "wb") as f:
-            f.write(await file.read())
+            f.write(content)
 
         midi_data, detected_bpm, detected_ts = await asyncio.to_thread(
-            full_audio_processing, safe_input_path, clean_target
+            chunked_audio_processing, safe_input_path, session_dir
         )
 
         sec_per_quarter = 60.0 / detected_bpm
@@ -237,25 +312,21 @@ async def convert_audio_ai(file: UploadFile = File(...)):
         grid_step = sec_per_quarter / 4.0
 
         all_notes = []
-        for inst in midi_data.instruments:
-            for n in inst.notes:
-                if (n.end - n.start) >= 0.08 and n.velocity >= 38:
-                    while n.pitch < 55:
-                        n.pitch += 12
-                    while n.pitch > 88:
-                        n.pitch -= 12
+        for n in midi_data.notes:
+            if (n.end - n.start) >= 0.08 and n.velocity >= 38:
+                while n.pitch < 55:
+                    n.pitch += 12
+                while n.pitch > 88:
+                    n.pitch -= 12
 
-                    n.start = round(n.start / grid_step) * grid_step
-                    n.end = round(n.end / grid_step) * grid_step
-                    if n.end <= n.start:
-                        n.end = n.start + grid_step
-                    all_notes.append(n)
+                n.start = round(n.start / grid_step) * grid_step
+                n.end = round(n.end / grid_step) * grid_step
+                if n.end <= n.start:
+                    n.end = n.start + grid_step
+                all_notes.append(n)
 
         if not all_notes:
-            raise HTTPException(status_code=422, detail="Nenhuma nota musical clara detetada no áudio.")
-
-        for inst in midi_data.instruments:
-            inst.notes = all_notes
+            raise HTTPException(status_code=422, detail="Nenhuma nota musical clara detetada neste áudio.")
 
         midi_filename = f"partitura_{session_id}.mid"
         midi_path = OUTPUT_DIR / midi_filename
@@ -338,15 +409,22 @@ async def convert_audio_ai(file: UploadFile = File(...)):
             "clef_name": "Clave de Sol"
         }
 
+    except HTTPException as he:
+        raise he
     except Exception as e:
         print("ERRO DETALHADO NO BACKEND:")
         print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
     finally:
-        for p in [safe_input_path, clean_target]:
+        if safe_input_path.exists():
             try:
-                if p.exists():
-                    p.unlink()
+                safe_input_path.unlink()
+            except Exception:
+                pass
+        import shutil
+        if session_dir.exists():
+            try:
+                shutil.rmtree(session_dir)
             except Exception:
                 pass
         gc.collect()
