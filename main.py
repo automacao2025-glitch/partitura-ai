@@ -1,14 +1,18 @@
 import os
-import shutil
+import gc
+import uuid
 import asyncio
 import traceback
 from pathlib import Path
+from collections import defaultdict
 import numpy as np
+import librosa
 import soundfile as sf
 import music21
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse
 from basic_pitch.inference import predict
+from basic_pitch import ICASSP_2022_MODEL_PATH
 
 app = FastAPI(title="Partitura.ai - Universal Engine")
 
@@ -72,7 +76,7 @@ HTML_TEMPLATE = """
         <form id="uploadForm">
             <div class="upload-box" onclick="document.getElementById('audioFile').click()">
                 <strong style="font-size: 17px; color: #1e293b;">Clique aqui ou arraste o seu ficheiro de áudio</strong><br>
-                <span style="font-size: 13px; color: #64748b; display: inline-block; margin-top: 6px;">Formatos suportados: WAV, FLAC, OGG (ou MP3 compatível)</span>
+                <span style="font-size: 13px; color: #64748b; display: inline-block; margin-top: 6px;">Formatos suportados: MP3, WAV, M4A, FLAC, OGG</span>
                 <input type="file" id="audioFile" name="file" accept=".mp3,.m4a,.wav,.flac,.ogg" style="display: none;" required>
             </div>
             
@@ -181,21 +185,35 @@ HTML_TEMPLATE = """
 </html>
 """
 
-def fast_audio_processing(safe_input_path: Path):
-    clean_target = UPLOAD_DIR / "normalized_input.wav"
+def fast_audio_processing(safe_input_path: Path, clean_target: Path):
     try:
-        data, samplerate = sf.read(str(safe_input_path))
-        if len(data.shape) > 1:
-            data = np.mean(data, axis=1)
+        # Carrega até 90s em 22050Hz Mono (suporta MP3, M4A, WAV e protege os 512MB de RAM do Render)
+        y, sr = librosa.load(str(safe_input_path), sr=22050, mono=True, duration=90.0)
         
-        # Normalização simples para WAV PCM 16-bit compatível com o basic-pitch
-        sf.write(str(clean_target), data, samplerate, subtype='PCM_16')
+        # Separação rápida de harmonia (remove batidas secas de percussão)
+        y_harmonic, _ = librosa.effects.hpss(y)
+        sf.write(str(clean_target), y_harmonic, sr, subtype='PCM_16')
 
-        bpm = 120.0
-        time_sig = "4/4"
+        # Deteção real de BPM e Compasso
+        onset_env = librosa.onset.onset_strength(y=y_harmonic, sr=sr)
+        tempo, _ = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
+        bpm = float(np.ndim(tempo) and tempo[0] or tempo)
+        if bpm <= 0:
+            bpm = 120.0
+        if bpm > 165:
+            bpm /= 2.0
+        elif bpm < 58:
+            bpm *= 2.0
 
-        _, midi_data, _ = predict(str(clean_target.resolve()))
-        return midi_data, str(clean_target), round(bpm, 1), time_sig
+        time_sig = "2/4" if bpm >= 128 else "4/4"
+
+        # Liberta memória antes de chamar a IA
+        del y, y_harmonic, onset_env
+        gc.collect()
+
+        # Passa explicitamente o ICASSP_2022_MODEL_PATH para nunca dar erro de argumento
+        _, midi_data, _ = predict(str(clean_target.resolve()), ICASSP_2022_MODEL_PATH)
+        return midi_data, round(bpm, 1), time_sig
     except Exception as e:
         raise RuntimeError(f"Erro no processamento de áudio: {type(e).__name__} - {str(e)}")
 
@@ -205,34 +223,34 @@ async def home():
 
 @app.post("/convert")
 async def convert_audio_ai(file: UploadFile = File(...)):
-    ext = os.path.splitext(file.filename)[1].lower()
-    safe_input_path = UPLOAD_DIR / f"raw_upload{ext}"
+    session_id = uuid.uuid4().hex[:8]
+    ext = os.path.splitext(file.filename)[1].lower() or ".wav"
+    safe_input_path = UPLOAD_DIR / f"raw_{session_id}{ext}"
+    clean_target = UPLOAD_DIR / f"norm_{session_id}.wav"
     
     try:
         with open(safe_input_path, "wb") as f:
             f.write(await file.read())
 
-        midi_data, clean_harm_path, detected_bpm, detected_ts = await asyncio.to_thread(
-            fast_audio_processing, safe_input_path
+        midi_data, detected_bpm, detected_ts = await asyncio.to_thread(
+            fast_audio_processing, safe_input_path, clean_target
         )
 
         sec_per_quarter = 60.0 / detected_bpm
         beats_per_bar = int(detected_ts.split("/")[0])
-        grid_step = sec_per_quarter / 4.0 
+        grid_step = sec_per_quarter / 4.0
 
         all_notes = []
         for inst in midi_data.instruments:
             for n in inst.notes:
-                if (n.end - n.start) >= 0.08 and n.velocity >= 35:
-                    
-                    if n.pitch < 57: # 57 = A3 (Lá3)
-                        n.pitch += 12 
-                    if n.pitch < 57: 
-                        n.pitch += 12 
-                        
+                if (n.end - n.start) >= 0.08 and n.velocity >= 38:
+                    while n.pitch < 55:
+                        n.pitch += 12
+                    while n.pitch > 88:
+                        n.pitch -= 12
+
                     n.start = round(n.start / grid_step) * grid_step
                     n.end = round(n.end / grid_step) * grid_step
-                    
                     if n.end <= n.start:
                         n.end = n.start + grid_step
                     all_notes.append(n)
@@ -240,62 +258,55 @@ async def convert_audio_ai(file: UploadFile = File(...)):
         if not all_notes:
             raise HTTPException(status_code=422, detail="Nenhuma nota musical clara detetada no áudio.")
 
-        midi_filename = "partitura_exata.mid"
+        for inst in midi_data.instruments:
+            inst.notes = all_notes
+
+        midi_filename = f"partitura_{session_id}.mid"
         midi_path = OUTPUT_DIR / midi_filename
         midi_data.write(str(midi_path))
+
+        clusters_by_ql = defaultdict(list)
+        for n in all_notes:
+            start_ql = round((n.start / sec_per_quarter) * 4) / 4.0
+            clusters_by_ql[start_ql].append(n)
+
+        sorted_offsets = sorted(clusters_by_ql.keys())
 
         part = music21.stream.Part()
         part.insert(0, music21.clef.TrebleClef())
         part.insert(0, music21.meter.TimeSignature(detected_ts))
         part.insert(0, music21.tempo.MetronomeMark(number=detected_bpm))
 
-        notes_sorted = sorted(all_notes, key=lambda x: x.start)
-        clusters = []
-        for n in notes_sorted:
-            if not clusters or (n.start - clusters[-1][0].start) > 0.05:
-                clusters.append([n])
-            else:
-                clusters[-1].append(n)
+        for idx, start_ql in enumerate(sorted_offsets):
+            cluster = clusters_by_ql[start_ql]
+            raw_dur_ql = max((c.end - c.start) / sec_per_quarter for c in cluster)
+            dur_ql = round(raw_dur_ql * 4) / 4.0
 
-        for idx, cluster in enumerate(clusters):
-            raw_start = cluster[0].start / sec_per_quarter
-            raw_dur = max(c.end for c in cluster) / sec_per_quarter - raw_start
-            
-            if idx + 1 < len(clusters):
-                next_start = clusters[idx + 1][0].start / sec_per_quarter
-                if raw_start + raw_dur > next_start:
-                    raw_dur = next_start - raw_start
-            
-            start_ql = round(raw_start * 4) / 4.0
-            dur_ql = round(raw_dur * 4) / 4.0
-            
-            if dur_ql < 0.25: dur_ql = 0.25
-            if dur_ql > beats_per_bar: dur_ql = float(beats_per_bar)
-            
-            pitches_in_cluster = sorted(list({c.pitch for c in cluster}))[-2:]
-            
+            if idx + 1 < len(sorted_offsets):
+                max_allowed = sorted_offsets[idx + 1] - start_ql
+                if dur_ql > max_allowed:
+                    dur_ql = max_allowed
+
+            dur_ql = max(0.25, min(float(beats_per_bar), dur_ql))
+            pitches_in_cluster = sorted(list({int(c.pitch) for c in cluster}))[-2:]
+
             if len(pitches_in_cluster) == 1:
-                el = music21.note.Note()
-                el.pitch.midi = int(pitches_in_cluster[0])
+                el = music21.note.Note(pitches_in_cluster[0])
             else:
-                notas_acorde = []
-                for p in pitches_in_cluster:
-                    n_obj = music21.note.Note()
-                    n_obj.pitch.midi = int(p)
-                    notas_acorde.append(n_obj)
-                el = music21.chord.Chord(notas_acorde)
-            
+                el = music21.chord.Chord(pitches_in_cluster)
+
             el.quarterLength = dur_ql
             part.insert(start_ql, el)
 
-        part.quantize(quarterLengthDivisors=(2, 4), processOffsets=True, processDurations=True, inPlace=True)
-
         ks = music21.analysis.discrete.KrumhanslSchmuckler()
         detected_key = ks.getSolution(part)
-        key_sig = music21.key.KeySignature(detected_key.sharps)
-        part.insert(0, key_sig)
+        part.insert(0, music21.key.KeySignature(detected_key.sharps))
 
-        tonica_map = {'C': 'Dó', 'G': 'Sol', 'D': 'Ré', 'A': 'Lá', 'E': 'Mi', 'B': 'Si', 'F#': 'Fá#', 'F': 'Fá', 'Bb': 'Sib', 'Eb': 'Mib', 'Ab': 'Láb'}
+        tonica_map = {
+            'C': 'Dó', 'C#': 'Dó#', 'D-': 'Réb', 'D': 'Ré', 'E-': 'Mib', 'E': 'Mi',
+            'F': 'Fá', 'F#': 'Fá#', 'G-': 'Solb', 'G': 'Sol', 'A-': 'Láb', 'A': 'Lá',
+            'B-': 'Sib', 'B': 'Si'
+        }
         tonic_pt = tonica_map.get(detected_key.tonic.name, detected_key.tonic.name)
         mode_pt = "Maior" if detected_key.mode == "major" else "Menor"
         key_label = f"{tonic_pt} {mode_pt}"
@@ -308,15 +319,19 @@ async def convert_audio_ai(file: UploadFile = File(...)):
         measured_part = part.makeMeasures(inPlace=False)
         measured_part.makeTies(inPlace=True)
         measured_part.makeBeams(inPlace=True)
-        measured_part.makeNotation(inPlace=True)
-        
+
         final_score.append(measured_part)
 
-        xml_path = OUTPUT_DIR / "partitura_exata.musicxml"
+        xml_path = OUTPUT_DIR / f"partitura_{session_id}.musicxml"
         final_score.write('musicxml', fp=str(xml_path))
 
         with open(xml_path, "r", encoding="utf-8") as xf:
             xml_content = xf.read()
+
+        try:
+            xml_path.unlink()
+        except Exception:
+            pass
 
         return {
             "midi_url": f"/download/{midi_filename}",
@@ -328,20 +343,26 @@ async def convert_audio_ai(file: UploadFile = File(...)):
         }
 
     except Exception as e:
-        erro_completo = traceback.format_exc()
         print("ERRO DETALHADO NO BACKEND:")
-        print(erro_completo)
+        print(traceback.format_exc())
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        for p in UPLOAD_DIR.glob("*"):
-            try: p.unlink()
-            except Exception: pass
+        for p in [safe_input_path, clean_target]:
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+        gc.collect()
 
 @app.get("/download/{filename}")
 async def download_file(filename: str):
     file_path = OUTPUT_DIR / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Ficheiro não encontrado.")
     return FileResponse(str(file_path), media_type='audio/midi', filename=filename)
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8005, reload=True)
+    port = int(os.environ.get("PORT", 8005))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
