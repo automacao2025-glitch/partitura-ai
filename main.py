@@ -4,7 +4,6 @@ import asyncio
 import traceback
 from pathlib import Path
 import numpy as np
-import librosa
 import soundfile as sf
 import music21
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -73,8 +72,8 @@ HTML_TEMPLATE = """
         <form id="uploadForm">
             <div class="upload-box" onclick="document.getElementById('audioFile').click()">
                 <strong style="font-size: 17px; color: #1e293b;">Clique aqui ou arraste o seu ficheiro de áudio</strong><br>
-                <span style="font-size: 13px; color: #64748b; display: inline-block; margin-top: 6px;">Formatos suportados: MP3, WAV, M4A</span>
-                <input type="file" id="audioFile" name="file" accept=".mp3,.m4a,.wav" style="display: none;" required>
+                <span style="font-size: 13px; color: #64748b; display: inline-block; margin-top: 6px;">Formatos suportados: WAV, FLAC, OGG (ou MP3 compatível)</span>
+                <input type="file" id="audioFile" name="file" accept=".mp3,.m4a,.wav,.flac,.ogg" style="display: none;" required>
             </div>
             
             <div id="fileStatus">
@@ -87,7 +86,7 @@ HTML_TEMPLATE = """
         <div id="loadingSection">
             <div class="spinner"></div>
             <h3 style="margin: 0 0 6px 0;">⚡ A processar a IA...</h3>
-            <p id="stepText" style="margin: 0; font-size: 14px;">A converter formato e a compor pauta musical em Clave de Sol...</p>
+            <p id="stepText" style="margin: 0; font-size: 14px;">A analisar áudio e a compor pauta musical em Clave de Sol...</p>
         </div>
 
         <div id="resultSection">
@@ -185,40 +184,20 @@ HTML_TEMPLATE = """
 def fast_audio_processing(safe_input_path: Path):
     clean_target = UPLOAD_DIR / "normalized_input.wav"
     try:
-        try:
-            y, sr = librosa.load(str(safe_input_path), sr=22050, mono=True)
-        except Exception:
-            try:
-                data, samplerate = sf.read(str(safe_input_path))
-                if len(data.shape) > 1:
-                    data = np.mean(data, axis=1)
-                if samplerate != 22050:
-                    import scipy.signal
-                    num_samples = int(len(data) * 22050 / samplerate)
-                    data = scipy.signal.resample(data, num_samples)
-                y, sr = data.astype(np.float32), 22050
-            except Exception as e2:
-                raise RuntimeError(f"Não foi possível ler este formato de áudio. Tente enviar um ficheiro .MP3 ou .WAV. Erro técnico: {str(e2)}")
+        data, samplerate = sf.read(str(safe_input_path))
+        if len(data.shape) > 1:
+            data = np.mean(data, axis=1)
         
-        sf.write(str(clean_target), y, sr, subtype='PCM_16')
+        # Normalização simples para WAV PCM 16-bit compatível com o basic-pitch
+        sf.write(str(clean_target), data, samplerate, subtype='PCM_16')
 
-        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-        tempo_result = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr)
-        tempo = tempo_result[0] if isinstance(tempo_result, tuple) else tempo_result
-        
-        bpm = float(np.ndim(tempo) and tempo[0] or tempo)
-        if bpm <= 0 or np.isnan(bpm): bpm = 120.0
-        if bpm > 170: bpm /= 2.0
-        elif bpm < 55: bpm *= 2.0
-        
-        time_sig = "2/4" if bpm > 130 else "4/4"
+        bpm = 120.0
+        time_sig = "4/4"
 
         _, midi_data, _ = predict(str(clean_target.resolve()))
         return midi_data, str(clean_target), round(bpm, 1), time_sig
-    except RuntimeError as re:
-        raise re
     except Exception as e:
-        raise RuntimeError(f"Erro no pipeline rápido: {type(e).__name__} - {str(e)}")
+        raise RuntimeError(f"Erro no processamento de áudio: {type(e).__name__} - {str(e)}")
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
